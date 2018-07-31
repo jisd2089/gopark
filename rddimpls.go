@@ -245,7 +245,7 @@ type _TextFileRDD struct {
     splitSize int64
 }
 
-func (t *_TextFileRDD) compute(split Split) Yielder {
+func (t *_TextFileRDD) compute(split Split)  Yielder {
     yield := make(chan interface{}, 100)
     go func() {
         parklog("Computing <%s> on Split[%d]", t, split.getIndex())
