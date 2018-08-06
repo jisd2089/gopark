@@ -8,12 +8,11 @@ import (
 	"github.com/mijia/gopark"
 	"time"
 	"sync"
-	"path"
 	"os"
 	"strings"
 )
 
-type MapperFunc func(interface{}) interface{}
+type MapperFunc func(interface{}) []interface{}
 type PartitionMapperFunc func(Yielder) Yielder
 type FlatMapperFunc func(interface{}) []interface{}
 type ReducerFunc func(interface{}, interface{}) interface{}
@@ -52,6 +51,8 @@ type DStream interface {
 	Join() DStream
 
 	setContext(context *StreamingContext)
+	getContext() *StreamingContext
+	getSlideDuration() time.Duration
 	zeroTime() *time.Time
 	register()
 	parentRememberDuration() time.Duration
@@ -131,6 +132,14 @@ func (s *baseDStream) setContext(context *StreamingContext) {
 	for _, dep := range s.dependencies {
 		dep.setContext(context)
 	}
+}
+
+func (s *baseDStream) getContext() *StreamingContext {
+	return s.ssc
+}
+
+func (s *baseDStream) getSlideDuration() time.Duration {
+	return s.slideDuration
 }
 
 func (s *baseDStream) zeroTime() *time.Time {
@@ -330,9 +339,20 @@ type StateDStream struct {
 
 type UnionDStream struct {
 	*baseDStream
+	parents []DStream
 }
 
 func (u *UnionDStream) init(parents []DStream) {
+	u.baseDStream.init(parents[0].getContext(), parents[0])
+	u.parents = parents
+	u.dependencies = parents
+	u.slideDuration = parents[0].getSlideDuration()
+}
+
+func newUnionDStream(parents []DStream) DStream {
+	unionDStream := &UnionDStream{}
+	unionDStream.init(parents)
+	return unionDStream
 }
 
 type WindowedDStream struct {
@@ -379,27 +399,46 @@ func (i *InputDStream) stop() {
 
 type ConstantInputDStream struct {
 	*InputDStream
+	rdd gopark.RDD
+}
+
+func (c *ConstantInputDStream) init(ssc *StreamingContext, rdd gopark.RDD) {
+	c.InputDStream.init(ssc)
+	c.rdd = rdd
+}
+
+func newConstantInputDStream(ssc *StreamingContext, rdd gopark.RDD) DStream {
+	constantInputDStream := &ConstantInputDStream{}
+	constantInputDStream.init(ssc, rdd)
+	return constantInputDStream
 }
 
 type ModTimeAndRangeFilter struct {
-	lastModTime   time.Time
+	lastModTime   int64
 	latestModTime time.Time
-	oldThreshold  int
+	oldThreshold  int64
 	accessedFiles map[string]int
 	oldFiles      []string
 }
 
-func (m *ModTimeAndRangeFilter) init(lastModTime time.Time, oldThreshold int) {
+func (m *ModTimeAndRangeFilter) init(lastModTime int64, oldThreshold int64) *ModTimeAndRangeFilter {
 	m.lastModTime = lastModTime
 	m.latestModTime = time.Now()
 	m.oldThreshold = oldThreshold
 	m.accessedFiles = make(map[string]int, 0)
 	m.oldFiles = make([]string, 0)
+	return m
+}
+
+func newModTimeAndRangeFilter(lastModTime int64, oldThreshold int64) *ModTimeAndRangeFilter {
+	modTimeAndRangeFilter := &ModTimeAndRangeFilter{}
+	modTimeAndRangeFilter.init(lastModTime, oldThreshold)
+	return modTimeAndRangeFilter
 }
 
 func (m *ModTimeAndRangeFilter) call(path string) {
-	if _, err := os.Stat(path); err != nil{
-		if os.IsNotExist(err){
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
 			return
 		}
 	}
@@ -410,7 +449,6 @@ func (m *ModTimeAndRangeFilter) call(path string) {
 		}
 	}
 
-
 }
 
 func (m *ModTimeAndRangeFilter) rotate() {
@@ -419,25 +457,65 @@ func (m *ModTimeAndRangeFilter) rotate() {
 
 type FileInputDStream struct {
 	*InputDStream
-	directory string
+	directory    string
+	filter       func(path string)
+	newFilesOnly bool
 }
 
-func (n *FileInputDStream) init(ssc *StreamingContext, directory string, newFilesOnly bool, oldThreshold int) {
+func (n *FileInputDStream) init(ssc *StreamingContext, directory string, newFilesOnly bool, oldThreshold int64) {
 	n.InputDStream.init(ssc)
 	n.directory = directory
+	var lastModTime int64
+	if newFilesOnly {
+		lastModTime = time.Now().UnixNano() - oldThreshold
+	} else {
+		lastModTime = 0
+	}
+	n.filter = newModTimeAndRangeFilter(lastModTime, oldThreshold).call
+	n.newFilesOnly = newFilesOnly
 
 }
 
-func newFileInputDStream() DStream {
-	return
+func newFileInputDStream(ssc *StreamingContext, directory string, newFilesOnly bool, oldThreshold int64) DStream {
+	fileInputDStream := &FileInputDStream{}
+	fileInputDStream.init(ssc, directory, newFilesOnly, oldThreshold)
+	return fileInputDStream
 }
 
 type RotatingFilesInputDStream struct {
 	*InputDStream
+	files []string
+}
+
+func (n *RotatingFilesInputDStream) init(ssc *StreamingContext, files []string) {
+	n.InputDStream.init(ssc)
+	n.files = files
+}
+
+func newRotatingFilesInputDStream(ssc *StreamingContext, files []string) DStream {
+	rotatingFilesInputDStream := &RotatingFilesInputDStream{}
+	rotatingFilesInputDStream.init(ssc, files)
+	return rotatingFilesInputDStream
 }
 
 type QueueInputDStream struct {
 	*InputDStream
+	queue      []gopark.RDD
+	oneAtAtime bool
+	defaultRDD gopark.RDD
+}
+
+func (q *QueueInputDStream) init(ssc *StreamingContext, queue []gopark.RDD, oneAtAtime bool, defaultRDD gopark.RDD) {
+	q.InputDStream.init(ssc)
+	q.queue = queue
+	q.oneAtAtime = oneAtAtime
+	q.defaultRDD = defaultRDD
+}
+
+func newQueueInputDStream(ssc *StreamingContext, queue []gopark.RDD, oneAtAtime bool, defaultRDD gopark.RDD) DStream {
+	queueInputDStream := &QueueInputDStream{}
+	queueInputDStream.init(ssc, queue, oneAtAtime, defaultRDD)
+	return queueInputDStream
 }
 
 type NetworkInputDStream struct {
@@ -451,6 +529,10 @@ func (n *NetworkInputDStream) init(ssc *StreamingContext, fn func()) {
 	n.InputDStream.init(ssc)
 	n.fn = fn
 	n.messages = make([]byte, 0)
+}
+
+func (n *NetworkInputDStream) startReceiver() {
+
 }
 
 func newNetworkInputDStream(ssc *StreamingContext, fn func()) DStream {

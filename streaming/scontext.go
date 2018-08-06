@@ -27,7 +27,7 @@ type StreamingContext struct {
 	checkpointDir      string
 	checkpointDuration time.Duration
 	scheduler          *Scheduler
-	lastCheckpointTime *time.Time
+	lastCheckpointTime time.Time
 	batchCallback      func()
 }
 
@@ -100,8 +100,80 @@ func (c *StreamingContext) customStream(fn func()) DStream {
 	return ds
 }
 
-func (c *StreamingContext) fileStream() DStream {
-	return
+func (c *StreamingContext) fileStream(directory string, newFilesOnly bool, oldThreshold int64) DStream {
+	ds := newFileInputDStream(c, directory, newFilesOnly, oldThreshold)
+	c.registerInputStream(ds)
+	return ds
+}
+
+func (c *StreamingContext) rotatingFiles(files []string) DStream {
+	ds := newRotatingFilesInputDStream(c, files)
+	c.registerInputStream(ds)
+	return ds
+}
+
+func (c *StreamingContext) textFileStream(directory string, newFilesOnly bool, oldThreshold int64) DStream {
+	return c.fileStream(directory, newFilesOnly, oldThreshold).Map(func(x interface{}) []interface{} {
+		keyValue := x.(*gopark.KeyValue)
+		values := keyValue.Value.([]interface{})
+		results := make([]interface{}, len(values))
+		for i := range values {
+			results[i] = &gopark.KeyValue{
+				Key:   keyValue.Key,
+				Value: values[i],
+			}
+		}
+		return results
+	})
+}
+
+func (c *StreamingContext) makeStream(rdd gopark.RDD) DStream {
+	return newConstantInputDStream(c, rdd)
+}
+
+func (c *StreamingContext) queueStream(queue []gopark.RDD, oneAtAtime bool, defaultRDD gopark.RDD) DStream {
+	ds := newQueueInputDStream(c, queue, oneAtAtime, defaultRDD)
+	c.registerInputStream(ds)
+	return ds
+}
+
+func (c *StreamingContext) union(streams []DStream) DStream {
+	return newUnionDStream(streams)
+}
+
+func (c *StreamingContext) start(t time.Time) {
+	c.sc.Start()
+	for _, ds := range c.graph.inputStreams {
+		switch ds.(type) {
+		case *NetworkInputDStream:
+			ds.(*NetworkInputDStream).startReceiver()
+		}
+	}
+
+	c.scheduler = newScheduler(c)
+	c.scheduler.start(t)
+}
+
+func (c *StreamingContext) runOnce() bool {
+	return c.scheduler.runOnce()
+}
+
+func (c *StreamingContext) awaitTermination(timeout time.Duration) {
+
+}
+
+func (c *StreamingContext) stop() {
+	if c.scheduler != nil {
+		c.scheduler.stop()
+	}
+}
+
+func (c *StreamingContext) doCheckpoint(time time.Time) {
+	if c.checkpointDuration > 0 && time.After(c.lastCheckpointTime.Add(c.checkpointDuration)) {
+		c.lastCheckpointTime = time
+		c.graph.UpdateCheckpointData(time)
+		newCheckpoint(c, time).write(c.checkpointDir)
+	}
 }
 
 type Interval struct {
@@ -208,12 +280,13 @@ func (g *DStreamGraph) AddOutputStream(output DStream) {
 	g.outputStreams = append(g.outputStreams, output)
 }
 
-func (g *DStreamGraph) GenerateRDDs(time time.Time) []gopark.RDD {
+func (g *DStreamGraph) GenerateRDDs(time time.Time) []*Job {
+	var jobList []*Job
 	for _, out := range g.outputStreams {
 		out.generateJob(time)
 		// TODO
 	}
-	return nil
+	return jobList
 }
 
 func (g *DStreamGraph) ForgetOldRDDs(time time.Time) {
@@ -248,6 +321,12 @@ func (cp *Checkpoint) init(ssc *StreamingContext, time time.Time) {
 	cp.graph = ssc.graph
 	cp.checkpointDuration = ssc.checkpointDuration
 	cp.batchDuration = ssc.batchDuration
+}
+
+func newCheckpoint(ssc *StreamingContext, time time.Time) *Checkpoint {
+	checkpoint := &Checkpoint{}
+	checkpoint.init(ssc, time)
+	return checkpoint
 }
 
 func (cp *Checkpoint) write(filePath string) {

@@ -74,7 +74,7 @@ func (c *Context) init() {
     log.Printf("Gpark Context [%s] initialzed.", c.jobName)
 }
 
-func (c *Context) start() {
+func (c *Context) Start() {
     if c.started {
         return
     }
@@ -118,7 +118,7 @@ func (c *Context) runRoutine(rdd RDD, partitions []int, rn ReducerFn) []Yielder 
         return nil
     }
 
-    c.start()
+    c.Start()
     return c.scheduler.runRoutine(rdd, partitions, rn)
 }
 
